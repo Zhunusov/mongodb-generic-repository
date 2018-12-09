@@ -6,9 +6,11 @@ using System.Linq.Expressions;
 using MongoDbGenericRepository.Models;
 using System.Linq;
 using MongoDbGenericRepository.Utils;
+using System.Collections.Concurrent;
 
 namespace MongoDbGenericRepository
 {
+
     /// <summary>
     /// The base Repository, it is meant to be inherited from by your custom custom MongoRepository implementation.
     /// Its constructor must be given a connection string and a database name.
@@ -990,13 +992,39 @@ namespace MongoDbGenericRepository
         }
 
         /// <summary>
+        /// Asynchronously returns a list of projected documents matching the filter condition.
+        /// </summary>
+        /// <typeparam name="TDocument">The type representing a Document.</typeparam>
+        /// <typeparam name="TKey">The type of the primary key for a Document.</typeparam>
+        /// <typeparam name="TGroupKey">The type of the grouping criteria.</typeparam>
+        /// <typeparam name="TProjection">The type of the projected group.</typeparam>
+        /// <param name="groupingCriteria">The grouping criteria.</param>
+        /// <param name="groupProjection">The projected group result.</param>
+        /// <param name="partitionKey">The partition key of your document, if any.</param>
+        public virtual List<TProjection> GroupBy<TDocument, TKey, TGroupKey, TProjection>(
+            Expression<Func<TDocument, bool>> filter,
+            Expression<Func<TDocument, TGroupKey>> groupingCriteria,
+            Expression<Func<IGrouping<TGroupKey, TDocument>, TProjection>> groupProjection,
+            string partitionKey = null)
+            where TDocument : IDocument<TKey>
+            where TKey : IEquatable<TKey>
+            where TProjection : class, new()
+        {
+            return HandlePartitioned<TDocument, TKey>(partitionKey)
+                             .Aggregate()
+                             .Match(Builders<TDocument>.Filter.Where(filter))
+                             .Group(groupingCriteria, groupProjection)
+                             .ToList();
+        }
+
+        /// <summary>
         /// Groups filtered a collection of documents given a grouping criteria, 
         /// and returns a dictionary of listed document groups with keys having the different values of the grouping criteria.
         /// </summary>
         /// <typeparam name="TDocument">The type representing a Document.</typeparam>
         /// <typeparam name="TGroupKey">The type of the grouping criteria.</typeparam>
         /// <typeparam name="TProjection">The type of the projected group.</typeparam>
-        /// <param name="filter"></param>
+        /// <param name="filter">The filter for the documents you want to group.</param>
         /// <param name="selector">The grouping criteria.</param>
         /// <param name="projection">The projected group result.</param>
         /// <param name="partitionKey">The partition key of your document, if any.</param>
@@ -1007,8 +1035,7 @@ namespace MongoDbGenericRepository
                                                        where TDocument : IDocument
                                                        where TProjection : class, new()
         {
-            var collection = string.IsNullOrEmpty(partitionKey) ? GetCollection<TDocument>() : GetCollection<TDocument>(partitionKey);
-            return collection.Aggregate()
+            return HandlePartitioned<TDocument>(partitionKey).Aggregate()
                              .Match(Builders<TDocument>.Filter.Where(filter))
                              .Group(selector, projection)
                              .ToList();
@@ -1016,6 +1043,35 @@ namespace MongoDbGenericRepository
 
 
         #endregion
+
+        #region Transactions
+
+        public class TransactionToken
+        {
+            public TransactionToken()
+            {
+                TransactionId = Guid.NewGuid();
+            }
+            public Guid TransactionId { get; set; }
+        }
+
+        private static ConcurrentDictionary<Guid, IClientSessionHandle> TransactionStore = new ConcurrentDictionary<Guid, IClientSessionHandle>();
+
+        public virtual TransactionToken BeginTransaction()
+        {
+            var session = MongoDbContext.Client.StartSession();
+            var transactionToken = new TransactionToken();
+            TransactionStore.TryAdd(transactionToken.TransactionId, session);
+            return transactionToken;
+        }
+
+        public virtual void RunTransaction<TDocument>(string partitionKey = null, List<Action<TDocument>> actions) where TDocument : IDocument
+        {
+            var collection = HandlePartitioned<TDocument>(partitionKey);
+
+        }
+
+        #endregion Transactions
 
         /// <summary>
         /// Asynchronously returns a paginated list of the documents matching the filter condition.
